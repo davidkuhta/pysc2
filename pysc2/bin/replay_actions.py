@@ -25,8 +25,10 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime
 
 from future.builtins import range  # pylint: disable=redefined-builtin
+from websocket import _exceptions
 import six
 from six.moves import queue
 
@@ -37,30 +39,89 @@ from pysc2.lib import protocol
 from pysc2.lib import remote_controller
 
 from absl import app
-from absl import flags
+from absl import flags #gflags?
 from pysc2.lib import gfile
 from s2clientprotocol import common_pb2 as sc_common
 from s2clientprotocol import sc2api_pb2 as sc_pb
 
+import numpy as np
+import json
+
 FLAGS = flags.FLAGS
 flags.DEFINE_integer("parallel", 1, "How many instances to run in parallel.")
 flags.DEFINE_integer("step_mul", 8, "How many game steps per observation.")
-flags.DEFINE_string("replays", None, "Path to a directory of replays.")
-flags.mark_flag_as_required("replays")
+flags.DEFINE_string("replay_list", None, "Path to a directory of replays.")
+flags.DEFINE_integer("print_time", 100, "Interval between stat prints and data saves in seconds")
+flags.DEFINE_bool("winner_only", False, "Process Replays for both winner and loser")
+flags.mark_flag_as_required("replay_list")
+FLAGS(sys.argv) #?
 
-
-size = point.Point(16, 16)
+screen_size = point.Point(84, 84)
+minimap_size = point.Point(16, 16)
 interface = sc_pb.InterfaceOptions(
     raw=True, score=False,
     feature_layer=sc_pb.SpatialCameraSetup(width=24))
-size.assign_to(interface.feature_layer.resolution)
-size.assign_to(interface.feature_layer.minimap_resolution)
+screen_size.assign_to(interface.feature_layer.resolution)
+minimap_size.assign_to(interface.feature_layer.minimap_resolution)
 
 
 def sorted_dict_str(d):
   return "{%s}" % ", ".join("%s: %s" % (k, d[k])
                             for k in sorted(d, key=d.get, reverse=True))
 
+
+def calc_armies(screen):
+    friendly_army = []
+    enemy_army = []
+    unit_list = np.unique(screen[6])
+    for unit in unit_list:
+        friendly_pixels = (screen[5] == 1) & (screen[6] == unit)
+        friendly_unit_count = sum(screen[14,friendly_pixels])
+        #only append if count > 0
+        if friendly_unit_count:
+            friendly_army.append([int(unit),friendly_unit_count])
+        enemy_pixels = (screen[5] == 4) & (screen[6] == unit)
+        enemy_unit_count = sum(screen[14,enemy_pixels])
+        if enemy_unit_count:
+            enemy_army.append([int(unit), enemy_unit_count])
+    return friendly_army, enemy_army
+
+def update_minimap(minimap,screen):
+    #Update minimap data with screen details
+    #Identify which minimap squares are on screen
+    visible = minimap[1] == 1
+    #TODO: need to devide screen into visible minimap, for now
+    #divide each quantity by number of visible minimap squares
+    total_visible = sum(visible.ravel())
+    #power
+    minimap[4,visible] = (sum(screen[3].ravel())/
+                          (len(screen[3].ravel())*total_visible))
+    #friendy army
+    friendly_units = screen[5] == 1
+    #unit density
+    minimap[5,visible] = sum(screen[14,friendly_units])/total_visible
+    #Most common unit
+    if friendly_units.any() == True:
+        minimap[6,visible] = np.bincount(screen[6,friendly_units]).argmax()
+    else:
+        minimap[6,visible] = 0
+    #Total HP + Shields
+    minimap[7,visible] = ((sum(screen[8,friendly_units]) +
+                          sum(screen[12,friendly_units]))/total_visible)
+    #enemy army
+    enemy_units = screen[5] == 4
+    #unit density
+    minimap[8,visible] = sum(screen[14,enemy_units])/total_visible
+    #main unit
+    if enemy_units.any() == True:
+        minimap[9,visible] = np.bincount(screen[6,enemy_units]).argmax()
+    else:
+        minimap[9,visible] = 0
+    #Total HP + shields
+    minimap[10,visible] = ((sum(screen[8,enemy_units]) +
+                            sum(screen[12,friendly_units]))/total_visible)
+
+    return minimap
 
 class ReplayStats(object):
   """Summary stats of the replays seen so far."""
@@ -147,20 +208,20 @@ class ProcessStats(object):
                 time.time() - self.time))
 
 
-def valid_replay(info, ping):
-  """Make sure the replay isn't corrupt, and is worth looking at."""
-  if (info.HasField("error") or
-      info.base_build != ping.base_build or  # different game version
-      info.game_duration_loops < 1000 or
-      len(info.player_info) != 2):
+def valid_replay(info, ping, replay, replay_list):
+    """Make sure the replay isn't corrupt, and is worth looking at."""
+    if info.HasField("error"):
+        print((" Replay has error field ").center(107, "="))
+        return False
+    if (info.base_build != ping.base_build or  # different game version
+        info.game_duration_loops < 1000 or
+        len(info.player_info) != 2):
     # Probably corrupt, or just not interesting.
-    return False
-  for p in info.player_info:
-    if p.player_apm < 10 or p.player_mmr < 1000:
-      # Low APM = player just standing around.
-      # Low MMR = corrupt replay or player who is weak.
-      return False
-  return True
+        return False
+    if replay[0:20] in replay_list:
+        print((" Replay has been processed ").center(107, "="))
+        return False
+    return True
 
 
 class ReplayProcessor(multiprocessing.Process):
@@ -172,6 +233,14 @@ class ReplayProcessor(multiprocessing.Process):
     self.run_config = run_config
     self.replay_queue = replay_queue
     self.stats_queue = stats_queue
+    self.replay_list = self.saved_replay_list()
+
+  def saved_replay_list(self):
+    replays = []
+    for root, dirs, files in os.walk("replay_state_data/"):
+        for name in files:
+            replays.append(name[0:20])
+    return replays
 
   def run(self):
     signal.signal(signal.SIGTERM, lambda a, b: sys.exit())  # Exit quietly.
@@ -187,45 +256,71 @@ class ReplayProcessor(multiprocessing.Process):
           for _ in range(300):
             try:
               replay_path = self.replay_queue.get()
+              print(replay_path)
             except queue.Empty:
               self._update_stage("done")
               self._print("Empty queue, returning")
               return
             try:
-              replay_name = os.path.basename(replay_path)[:10]
+              replay_name = os.path.basename(replay_path)#[:10]
               self.stats.replay = replay_name
               self._print("Got replay: %s" % replay_path)
               self._update_stage("open replay file")
               replay_data = self.run_config.replay_data(replay_path)
               self._update_stage("replay_info")
-              info = controller.replay_info(replay_data)
+              try:
+                  info = controller.replay_info(replay_data)
+              except _exceptions.WebSocketTimeoutException:
+                  self._print("Replay timedout in run.")
+                  break
               self._print((" Replay Info %s " % replay_name).center(60, "-"))
               self._print(info)
               self._print("-" * 60)
-              if valid_replay(info, ping):
+              if valid_replay(info, ping, replay_name, self.replay_list):
                 self.stats.replay_stats.maps[info.map_name] += 1
                 for player_info in info.player_info:
-                  race_name = sc_common.Race.Name(
-                      player_info.player_info.race_actual)
-                  self.stats.replay_stats.races[race_name] += 1
+                  r_n = sc_common.Race.Name(player_info.player_info.race_actual)
+                  self.stats.replay_stats.races[r_n] += 1
+                if info.player_info[0].player_result.result == 1:
+                    winner = 1
+                else:
+                    winner = 2
+
                 map_data = None
                 if info.local_map_path:
                   self._update_stage("open map file")
                   map_data = self.run_config.map_data(info.local_map_path)
-                for player_id in [1, 2]:
+
+                if FLAGS.winner_only:
+                    players_to_process = [winner]
+                else:
+                    players_to_process = [1, 2]
+                for player_id in players_to_process:
                   self._print("Starting %s from player %s's perspective" % (
                       replay_name, player_id))
-                  self.process_replay(controller, replay_data, map_data,
-                                      player_id)
+                  race = sc_common.Race.Name(info.player_info[player_id-1].player_info.race_actual)
+                  if player_id ==1:
+                      enemy = 2
+                  else:
+                      enemy = 1
+                  enemy_race = sc_common.Race.Name(info.player_info[enemy-1].player_info.race_actual)
+                  try:
+                      self.process_replay(controller, replay_data, map_data,
+                                          player_id, replay_name, info.map_name,
+                                          winner, race, enemy_race)
+                  except _exceptions.WebSocketTimeoutException:
+                      self._print("Replay timedout in run.")
+                      pass
               else:
                 self._print("Replay is invalid.")
-                self.stats.replay_stats.invalid_replays.add(replay_name)
+                #self.stats.replay_stats.invalid_replays.add(replay_name)
             finally:
               self.replay_queue.task_done()
           self._update_stage("shutdown")
       except (protocol.ConnectionError, protocol.ProtocolError,
               remote_controller.RequestError):
-        self.stats.replay_stats.crashing_replays.add(replay_name)
+        pass
+        #self.stats.replay_stats.crashing_replays.add(replay_name)
       except KeyboardInterrupt:
         return
 
@@ -237,14 +332,24 @@ class ReplayProcessor(multiprocessing.Process):
     self.stats.update(stage)
     self.stats_queue.put(self.stats)
 
-  def process_replay(self, controller, replay_data, map_data, player_id):
+  def process_replay(self, controller, replay_data, map_data,
+                     player_id, replay_id, map_name, winner,
+                     race, enemy_race):
     """Process a single replay, updating the stats."""
     self._update_stage("start_replay")
-    controller.start_replay(sc_pb.RequestStartReplay(
-        replay_data=replay_data,
-        map_data=map_data,
-        options=interface,
-        observed_player_id=player_id))
+    try:
+        controller.start_replay(sc_pb.RequestStartReplay(
+            replay_data=replay_data,
+            map_data=map_data,
+            options=interface,
+            observed_player_id=player_id))
+    except _exceptions.WebSocketTimeoutException:
+        self._print("Replay timedout in process_replay.")
+        return
+
+    #clear datafile
+    save_file = "replay_state_data/" + replay_id[0:20] + "_" + str(player_id) + '.json'
+    with open(save_file, 'w') as outfile: pass
 
     feat = features.Features(controller.game_info())
 
@@ -253,9 +358,19 @@ class ReplayProcessor(multiprocessing.Process):
     controller.step()
     while True:
       self.stats.replay_stats.steps += 1
+
+      # self._update_stage("Data munching")
+      # print(" Get that data ".center(107, "-"))
+      # txt_file = "replay_state_data/" + str(time.time()) + ".txt"
+      # with open(txt_file, 'w') as rawfile:
+      #     data = controller.data_raw()
+      #     print(data, file=rawfile)
+      # print(" Lets get some data ".center(107, "-"))
+      # data = controller.data_raw()
+
       self._update_stage("observe")
       obs = controller.observe()
-
+      actions = []
       for action in obs.actions:
         act_fl = action.action_feature_layer
         if act_fl.HasField("unit_command"):
@@ -271,10 +386,16 @@ class ReplayProcessor(multiprocessing.Process):
           self.stats.replay_stats.control_group += 1
 
         try:
+          full_act = feat.reverse_action(action)
           func = feat.reverse_action(action).function
+          args = full_act.arguments
         except ValueError:
           func = -1
+          args = []
+
+
         self.stats.replay_stats.made_actions[func] += 1
+        actions.append([func, args])
 
       for valid in obs.observation.abilities:
         self.stats.replay_stats.valid_abilities[valid.ability_id] += 1
@@ -284,6 +405,32 @@ class ReplayProcessor(multiprocessing.Process):
 
       for ability_id in feat.available_actions(obs.observation):
         self.stats.replay_stats.valid_actions[ability_id] += 1
+
+      all_features = feat.transform_obs(obs.observation)
+      #remove elevation, viz and selected data from minimap
+      minimap_data = all_features['minimap'][2:6,:,:]
+      screen = all_features['screen']
+
+      mini_shape = minimap_data.shape
+      minimap = np.zeros(shape=(11,mini_shape[1],mini_shape[2]),dtype=np.int)
+      minimap[0:4,:,:] = minimap_data
+      extended_minimap = update_minimap(minimap,screen).tolist()
+      friendly_army, enemy_army = calc_armies(screen)
+
+      all_feats_with_data = {}
+      for key in all_features.keys():
+        if not(all_features[key].size==0) and key != 'screen':
+          all_feats_with_data[key] = all_features[key].tolist()
+
+      full_state = {"replay_id":replay_id, "map_name":map_name, "player_id":player_id, "extended_minimap":extended_minimap,
+                    "friendly_army":friendly_army,"enemy_army":enemy_army,"all_feat_player":all_features['player'].tolist(),
+                    "all_feat_avail_actions":all_features['available_actions'].tolist(),"actions":actions,"winner":winner,
+                    "race":race,"enemy_race":enemy_race}#}, "all_features":all_features_with_data}
+
+      #save state to disk, line delimited
+      with open(save_file, 'a') as outfile:
+        json.dump(full_state, outfile)
+        outfile.write('\n')
 
       if obs.player_result:
         break
@@ -300,7 +447,7 @@ def stats_printer(stats_queue):
 
   running = True
   while running:
-    print_time += 10
+    print_time += FLAGS.print_time #10
 
     while time.time() < print_time:
       try:
@@ -333,8 +480,8 @@ def main(unused_argv):
   """Dump stats about all the actions that are in use in a set of replays."""
   run_config = run_configs.get()
 
-  if not gfile.Exists(FLAGS.replays):
-    sys.exit("{} doesn't exist.".format(FLAGS.replays))
+  if not gfile.Exists(FLAGS.replay_list):
+    sys.exit("{} doesn't exist.".format(FLAGS.replay_list))
 
   stats_queue = multiprocessing.Queue()
   stats_thread = threading.Thread(target=stats_printer, args=(stats_queue,))
@@ -345,9 +492,11 @@ def main(unused_argv):
     # queue in a separate thread. Grab the list synchronously so we know there
     # is work in the queue before the SC2 processes actually run, otherwise
     # The replay_queue.join below succeeds without doing any work, and exits.
-    print("Getting replay list:", FLAGS.replays)
-    replay_list = sorted(run_config.replay_paths(FLAGS.replays))
-    print(len(replay_list), "replays found.\n")
+    print("Getting replay list:", FLAGS.replay_list)
+    replay_list = []
+    with open(FLAGS.replay_list,'r') as f:
+        for line in f:
+            replay_list.append(line.rstrip())
     replay_queue = multiprocessing.JoinableQueue(FLAGS.parallel * 10)
     replay_queue_thread = threading.Thread(target=replay_queue_filler,
                                            args=(replay_queue, replay_list))
@@ -367,6 +516,8 @@ def main(unused_argv):
     stats_queue.put(None)  # Tell the stats_thread to print and exit.
     stats_thread.join()
 
+def entry_point():  # Needed so setup.py scripts work.
+  app.run(main)
 
 if __name__ == "__main__":
   app.run(main)

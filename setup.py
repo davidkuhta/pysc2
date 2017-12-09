@@ -76,6 +76,7 @@ setup(
             'pysc2_agent = pysc2.bin.agent:entry_point',
             'pysc2_play = pysc2.bin.play:entry_point',
             'pysc2_replay_info = pysc2.bin.replay_info:entry_point',
+            'pysc2_replay_actions = pysc2.bin.replay_actions:entry_point',
         ],
     },
     classifiers=[
